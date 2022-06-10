@@ -205,7 +205,7 @@ handle_call({query_txn, Txn}, From, #state{chain = Chain, group = Group} = State
     {ok, Height} = blockchain_ledger_v1:current_height(Ledger),
     spawn(fun() ->
               %% Reply may be return {ok, Position, QueueLength} or {error, not_found}
-              Reply = libp2p_group_relcast:handle_command(Group, {query_txn, Txn})
+              Reply = libp2p_group_relcast:handle_command(Group, {query_txn, Txn}),
               gen_server:reply(From, {Reply, Height})
           end),
     {noreply, State};
@@ -266,8 +266,8 @@ handle_info({Ref, {Res, Height}}, #state{validations = Validations, chain = Chai
                             ok ->
                                 %% avoid deadlock by not waiting for this.
                                 spawn(fun() ->
-                                            {ok, QueuePos, QueueLen} = libp2p_group_relcast:handle_command(Group, {txn, Txn}),
-                                            gen_server:reply(From, {ok, QueuePos, QueueLen, Height})
+                                            Reply = libp2p_group_relcast:handle_command(Group, {txn, Txn}),
+                                            gen_server:reply(From, {Reply, Height})
                                       end),
                                 ok;
                             Error ->
