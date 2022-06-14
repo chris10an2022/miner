@@ -24,7 +24,8 @@
          txn_invalid_nonce_test/1,
          txn_dependent_test/1,
          txn_from_future_via_protocol_v1_test/1,
-         txn_from_future_via_protocol_v2_test/1
+         txn_from_future_via_protocol_v2_test/1,
+         txn_queue_test/1
 
         ]).
 
@@ -36,7 +37,8 @@ all() -> [
 
           %% XXX v1 test is inconsistent. TODO Check if it can be fixed.
           {testcase, txn_from_future_via_protocol_v1_test, [{repeat_until_ok, 5}]},
-          txn_from_future_via_protocol_v2_test
+          txn_from_future_via_protocol_v2_test,
+          txn_queue_test
          ].
 
 init_per_suite(Config) ->
@@ -58,6 +60,7 @@ init_per_testcase(_TestCase, Config0) ->
     BlockTime =
         case _TestCase of
             txn_dependent_test -> 5000;
+%%            txn_queue_test -> 5000;
             _ -> ?config(block_time, Config)
         end,
 
@@ -93,7 +96,6 @@ init_per_testcase(_TestCase, Config0) ->
             end_per_testcase(_TestCase, Config),
             erlang:What(Why)
     end.
-
 
 end_per_testcase(_TestCase, Config) ->
     miner_ct_utils:end_per_testcase(_TestCase, Config).
@@ -356,6 +358,148 @@ txn_dependent_test(Config) ->
     ExpectedNonce = StartNonce +4,
     true = nonce_updated_for_miner(Addr, ExpectedNonce, ConMiners),
 
+    ok.
+
+
+
+txn_queue_test(Config) ->
+    %%
+    %% ------ WIP ----------
+    %%
+    %% send a bunch of txns via the grpc submit API
+    %% meck out the queue on hbbft so that the txns dont get pushed to the CG
+    %% confirm the txns are in the sidecar buffer
+    %% and that the query API returns data on their queue position
+    Miners = ?config(miners, Config),
+    Miner = hd(?config(non_consensus_miners, Config)),
+    ConMiners = ?config(consensus_miners, Config),
+    AddrList = ?config(tagged_miner_addresses, Config),
+
+    Addr = miner_ct_utils:node2addr(Miner, AddrList),
+
+    Chain = ct_rpc:call(Miner, blockchain_worker, blockchain, []),
+    ct:pal("consensus miners ~p", [ConMiners]),
+    ct:pal("miner in use ~p", [Miner]),
+
+    PayerAddr = Addr,
+    Payee = hd(miner_ct_utils:shuffle(ConMiners)),
+    PayeeAddr = miner_ct_utils:node2addr(Payee, AddrList),
+    {ok, _Pubkey, SigFun, _ECDHFun} = ct_rpc:call(Miner, blockchain_swarm, keys, []),
+    IgnoredTxns = [blockchain_txn_poc_request_v1],
+    StartNonce = miner_ct_utils:get_nonce(Miner, Addr),
+
+    %% meck out the sidecar random_n function
+    %% make it return an empty list
+    %% simulate an empty buffer
+    %% this should result in the submitted txns
+    %% remaining in the sidecar buffer
+    meck:new(hbbft_utils, [passthrough]),
+    [
+            ok =
+            ct_rpc:call(
+                Node,
+                meck,
+                expect,
+                [hbbft_utils, random_n, fun(_, _) -> [] end],
+                300
+            )
+    ||
+        Node <- ConMiners
+    ],
+
+    %% prep the txns, 1 - 4
+    Txn1 = ct_rpc:call(Miner, blockchain_txn_payment_v1, new, [PayerAddr, PayeeAddr, 1000, StartNonce+1]),
+    SignedTxn1 = ct_rpc:call(Miner, blockchain_txn_payment_v1, sign, [Txn1, SigFun]),
+    Txn2 = ct_rpc:call(Miner, blockchain_txn_payment_v1, new, [PayerAddr, PayeeAddr, 1000, StartNonce+2]),
+    SignedTxn2 = ct_rpc:call(Miner, blockchain_txn_payment_v1, sign, [Txn2, SigFun]),
+    Txn3 = ct_rpc:call(Miner, blockchain_txn_payment_v1, new, [PayerAddr, PayeeAddr, 1000, StartNonce+3]),
+    SignedTxn3 = ct_rpc:call(Miner, blockchain_txn_payment_v1, sign, [Txn3, SigFun]),
+    Txn4 = ct_rpc:call(Miner, blockchain_txn_payment_v1, new, [PayerAddr, PayeeAddr, 1000, StartNonce+4]),
+    SignedTxn4 = ct_rpc:call(Miner, blockchain_txn_payment_v1, sign, [Txn4, SigFun]),
+
+    %% get the start height
+    {ok, Height} = ct_rpc:call(Miner, blockchain, height, [Chain]),
+
+    %% send txns with nonces 1, 2 and 3, all out of sequence
+    %% we won't send txn with nonce 1 yet
+    %% this means the 3 submitted txns cannot be accepted and will remain in the txn mgr cache
+    %% until txn with nonce 1 gets submitted
+    %% keeping this here to confirm the txns were in the txn mgr queue
+    %% and get processed out
+
+    {ok, _Txn1Key, _Txn1SubmitHeight} = ct_rpc:call(Miner, blockchain_txn_mgr, grpc_submit, [SignedTxn1]),
+    {ok, _Txn2Key, _Txn2SubmitHeight} = ct_rpc:call(Miner, blockchain_txn_mgr, grpc_submit, [SignedTxn2]),
+    {ok, _Txn3Key, _Txn3SubmitHeight} = ct_rpc:call(Miner, blockchain_txn_mgr, grpc_submit, [SignedTxn3]),
+    {ok, _Txn4Key, _Txn4SubmitHeight} = ct_rpc:call(Miner, blockchain_txn_mgr, grpc_submit, [SignedTxn4]),
+
+    %% Wait a few blocks, confirm txns remain in the cache
+    ok = miner_ct_utils:wait_for_gte(height_exactly, Miners, Height + 3),
+
+    %% confirm all txns are still be in txn mgr cache
+    true = miner_ct_utils:wait_until(
+                                        fun()->
+                                            maps:size(get_cached_txns_with_exclusions(Miner, IgnoredTxns)) == 4
+                                        end, 60, 500),
+
+    %% now submit the remaining txn which will have the missing nonce
+    %% this should result in both this and the previous txns being accepted by the CG
+    %% and cleared out of the txn mgr cache
+    %% they should then be in the the hbbft queue of CG members
+    ok = ct_rpc:call(Miner, blockchain_worker, submit_txn, [SignedTxn1]),
+
+    %% Wait one more block
+    ok = miner_ct_utils:wait_for_gte(height_exactly, Miners, Height + 4),
+
+    %% confirm all txns are are gone from the cache
+    %% and have been accepted by the CG
+
+    true = miner_ct_utils:wait_until(
+                                        fun()->
+                                            maps:size(get_cached_txns_with_exclusions(Miner, IgnoredTxns)) == 0
+                                        end, 60, 100),
+
+    ok = miner_ct_utils:wait_for_gte(height_exactly, Miners, Height + 5),
+
+    %% query the CG and collect data on where the txns are in the sidecar queue
+    {ok, {_Txn1Miner, Txn1, Txn1QueuePos, Txn1QueueLen, _Txn1Height}}  = query_txn(ConMiners, Txn1),
+    {ok, {_Txn2Miner, Txn2, Txn2QueuePos, Txn2QueueLen, _Txn2Height}}  = query_txn(ConMiners, Txn2),
+    {ok, {_Txn3Miner, Txn3, Txn3QueuePos, Txn3QueueLen, _Txn3Height}}  = query_txn(ConMiners, Txn3),
+    {ok, {_Txn4Miner, Txn4, Txn4QueuePos, Txn4QueueLen, _Txn4Height}}  = query_txn(ConMiners, Txn4),
+
+    %% each txn should have been found in the queue
+    ?assert(Txn1QueuePos > 0 andalso Txn1QueueLen > 0),
+    ?assert(Txn2QueuePos > 0 andalso Txn2QueueLen > 0),
+    ?assert(Txn3QueuePos > 0 andalso Txn3QueueLen > 0),
+    ?assert(Txn4QueuePos > 0 andalso Txn4QueueLen > 0),
+
+    %% force one txn to be processed and then get the queue pos of the remaining txns
+    [
+        ok =
+            ct_rpc:call(
+                Node,
+                meck,
+                expect,
+                [hbbft_utils, random_n, fun(_, _) -> [Txn1] end],
+                300
+            )
+    ||
+        Node <- ConMiners
+    ],
+    %% wait until after the next block
+    ok = miner_ct_utils:wait_for_gte(height_exactly, Miners, Height + 5),
+
+    %% requery the CG and collect data on where the txns are in the sidecar queue
+    {error, not_found}  = query_txn(ConMiners, Txn1),
+    {ok, {_Txn2MinerB, Txn2, Txn2QueuePosB, Txn2QueueLenB, _Txn2HeightB}}  = query_txn(ConMiners, Txn2),
+    {ok, {_Txn3MinerB, Txn3, Txn3QueuePosB, Txn3QueueLenB, _Txn3HeightB}}  = query_txn(ConMiners, Txn3),
+    {ok, {_Txn4MinerB, Txn4, Txn4QueuePosB, Txn4QueueLenB, _Txn4HeightB}}  = query_txn(ConMiners, Txn4),
+
+    %% each txn should have been found in the queue
+    %% the txns may be spread over all the CG members
+    %% and as such their queue pos may not have changed ????
+    ?assert(Txn2QueuePosB > 0 andalso Txn2QueueLenB > 0),
+    ?assert(Txn3QueuePosB > 0 andalso Txn3QueueLenB > 0),
+    ?assert(Txn4QueuePosB > 0 andalso Txn4QueueLenB > 0),
     ok.
 
 txn_from_future_via_protocol_v2_test(Cfg) ->
@@ -634,3 +778,12 @@ nonce_updated_for_miner(Addr, ExpectedNonce, ConMiners)->
                           end, ConMiners),
             [true] == lists:usort(HaveNoncesIncremented)
         end, 200, 1000).
+
+query_txn([], _Txn) ->
+    {error, not_found};
+query_txn([Miner | RestMiners], Txn) ->
+    case ct_rpc:call(Miner, miner_hbbft_sidecar, handle_txn, [query_txn, Txn]) of
+        {{ok, QueuePos, QueueLen}, Height} ->
+            {ok, {Miner, Txn, QueuePos, QueueLen, Height}};
+        _ -> query_txn(RestMiners, Txn)
+    end.
