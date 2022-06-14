@@ -249,7 +249,7 @@ handle_command({txn, Txn}, State=#state{hbbft=HBBFT}) ->
 handle_command({query_txn, Txn}, State = #state{hbbft = HBBFT}) ->
     Buf = hbbft:buf(HBBFT),
     SerTxn = blockchain_txn:serialize(Txn),
-    case current_buffer_position(SerTxn, Buf) of
+    case current_buffer_position(Buf, SerTxn) of
         {ok, Position} when is_integer(Position) ->
             {reply, {ok, Position, length(Buf)}, ignore};
         {error, not_found} ->
@@ -834,13 +834,13 @@ bin_to_msg(<<Bin/binary>>) ->
     end.
 
 -spec current_buffer_position([Element], Element) ->
-    {ok, pos_integer()} | {error, not_found} when Element :: term()
+    {ok, pos_integer()} | {error, not_found} when Element :: term().
 current_buffer_position(List, Elem) -> current_buffer_position(List, Elem, 0).
 
 -spec current_buffer_position([Element], Element, non_neg_integer()) ->
-    {ok, pos_integer()} | {error, not_found} when Element :: term()
+    {ok, pos_integer()} | {error, not_found} when Element :: term().
 current_buffer_position([], _Elem, _Pos) -> {error, not_found};
-current_buffer_position([Elem|Rem], Elem, Pos) -> {ok, Pos + 1};
+current_buffer_position([Elem|_Rem], Elem, Pos) -> {ok, Pos + 1};
 current_buffer_position([_Head|Rem], Elem, Pos) -> current_buffer_position(Rem, Elem, Pos + 1).
 
 -ifdef(TEST).
