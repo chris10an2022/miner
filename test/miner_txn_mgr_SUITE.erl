@@ -420,19 +420,13 @@ txn_queue_test(Config) ->
     %% get the start height
     {ok, Height} = ct_rpc:call(Miner, blockchain, height, [Chain]),
 
-    %% send txns with nonces 1, 2 and 3, all out of sequence
-    %% we won't send txn with nonce 1 yet
-    %% this means the 3 submitted txns cannot be accepted and will remain in the txn mgr cache
-    %% until txn with nonce 1 gets submitted
-    %% keeping this here to confirm the txns were in the txn mgr queue
-    %% and get processed out
+    %% submit the txns via the grpc endpoint
+    {ok, Txn1Key, Txn1SubmitHeight} = ct_rpc:call(Miner, blockchain_txn_mgr, grpc_submit, [SignedTxn1]),
+    {ok, Txn2Key, Txn2SubmitHeight} = ct_rpc:call(Miner, blockchain_txn_mgr, grpc_submit, [SignedTxn2]),
+    {ok, Txn3Key, Txn3SubmitHeight} = ct_rpc:call(Miner, blockchain_txn_mgr, grpc_submit, [SignedTxn3]),
+    {ok, Txn4Key, Txn4SubmitHeight} = ct_rpc:call(Miner, blockchain_txn_mgr, grpc_submit, [SignedTxn4]),
 
-    {ok, _Txn1Key, _Txn1SubmitHeight} = ct_rpc:call(Miner, blockchain_txn_mgr, grpc_submit, [SignedTxn1]),
-    {ok, _Txn2Key, _Txn2SubmitHeight} = ct_rpc:call(Miner, blockchain_txn_mgr, grpc_submit, [SignedTxn2]),
-    {ok, _Txn3Key, _Txn3SubmitHeight} = ct_rpc:call(Miner, blockchain_txn_mgr, grpc_submit, [SignedTxn3]),
-    {ok, _Txn4Key, _Txn4SubmitHeight} = ct_rpc:call(Miner, blockchain_txn_mgr, grpc_submit, [SignedTxn4]),
-
-    %% Wait a few blocks, confirm txns remain in the cache
+    %% Wait a few blocks
     ok = miner_ct_utils:wait_for_gte(height_exactly, Miners, Height + 3),
 
     %% confirm all txns are still be in txn mgr cache
@@ -441,30 +435,15 @@ txn_queue_test(Config) ->
                                             maps:size(get_cached_txns_with_exclusions(Miner, IgnoredTxns)) == 4
                                         end, 60, 500),
 
-    %% now submit the remaining txn which will have the missing nonce
-    %% this should result in both this and the previous txns being accepted by the CG
-    %% and cleared out of the txn mgr cache
-    %% they should then be in the the hbbft queue of CG members
-    ok = ct_rpc:call(Miner, blockchain_worker, submit_txn, [SignedTxn1]),
-
-    %% Wait one more block
-    ok = miner_ct_utils:wait_for_gte(height_exactly, Miners, Height + 4),
-
-    %% confirm all txns are are gone from the cache
-    %% and have been accepted by the CG
-
-    true = miner_ct_utils:wait_until(
-                                        fun()->
-                                            maps:size(get_cached_txns_with_exclusions(Miner, IgnoredTxns)) == 0
-                                        end, 60, 100),
-
-    ok = miner_ct_utils:wait_for_gte(height_exactly, Miners, Height + 5),
-
     %% query the CG and collect data on where the txns are in the sidecar queue
-    {ok, {_Txn1Miner, Txn1, Txn1QueuePos, Txn1QueueLen, _Txn1Height}}  = query_txn(ConMiners, Txn1),
-    {ok, {_Txn2Miner, Txn2, Txn2QueuePos, Txn2QueueLen, _Txn2Height}}  = query_txn(ConMiners, Txn2),
-    {ok, {_Txn3Miner, Txn3, Txn3QueuePos, Txn3QueueLen, _Txn3Height}}  = query_txn(ConMiners, Txn3),
-    {ok, {_Txn4Miner, Txn4, Txn4QueuePos, Txn4QueueLen, _Txn4Height}}  = query_txn(ConMiners, Txn4),
+    {ok, {Txn1Miner, SignedTxn1, Txn1QueuePos, Txn1QueueLen, _Txn1Height}}  = sidecar_query_txn(ConMiners, SignedTxn1),
+    {ok, {Txn2Miner, SignedTxn2, Txn2QueuePos, Txn2QueueLen, _Txn2Height}}  = sidecar_query_txn(ConMiners, SignedTxn2),
+    {ok, {Txn3Miner, SignedTxn3, Txn3QueuePos, Txn3QueueLen, _Txn3Height}}  = sidecar_query_txn(ConMiners, SignedTxn3),
+    {ok, {Txn4Miner, SignedTxn4, Txn4QueuePos, Txn4QueueLen, _Txn4Height}}  = sidecar_query_txn(ConMiners, SignedTxn4),
+    ct:pal("Txn1Miner: ~p", [Txn1Miner]),
+    ct:pal("Txn2Miner: ~p", [Txn2Miner]),
+    ct:pal("Txn3Miner: ~p", [Txn3Miner]),
+    ct:pal("Txn4Miner: ~p", [Txn4Miner]),
 
     %% each txn should have been found in the queue
     ?assert(Txn1QueuePos > 0 andalso Txn1QueueLen > 0),
@@ -472,34 +451,54 @@ txn_queue_test(Config) ->
     ?assert(Txn3QueuePos > 0 andalso Txn3QueueLen > 0),
     ?assert(Txn4QueuePos > 0 andalso Txn4QueueLen > 0),
 
-    %% force one txn to be processed and then get the queue pos of the remaining txns
-    [
-        ok =
-            ct_rpc:call(
-                Node,
-                meck,
-                expect,
-                [hbbft_utils, random_n, fun(_, _) -> [Txn1] end],
-                300
-            )
-    ||
-        Node <- ConMiners
-    ],
-    %% wait until after the next block
-    ok = miner_ct_utils:wait_for_gte(height_exactly, Miners, Height + 5),
+    %% let a bunch of blocks pass to allow the txn mgr to re query
+    %% the acceptors and get updated queue data
+    %% the queue data returned here should be same as that returned
+    %% by our direct sidecar queries
+    ok = miner_ct_utils:wait_for_gte(height_exactly, Miners, Height + 8),
+    CurHeight = Height + 8,
 
-    %% requery the CG and collect data on where the txns are in the sidecar queue
-    {error, not_found}  = query_txn(ConMiners, Txn1),
-    {ok, {_Txn2MinerB, Txn2, Txn2QueuePosB, Txn2QueueLenB, _Txn2HeightB}}  = query_txn(ConMiners, Txn2),
-    {ok, {_Txn3MinerB, Txn3, Txn3QueuePosB, Txn3QueueLenB, _Txn3HeightB}}  = query_txn(ConMiners, Txn3),
-    {ok, {_Txn4MinerB, Txn4, Txn4QueuePosB, Txn4QueueLenB, _Txn4HeightB}}  = query_txn(ConMiners, Txn4),
+    %% translate the miner CG node names which have accepted our txns
+    %% into their relevant peer addrs
+    Txn1MinerAddr = miner_ct_utils:node2addr(Txn1Miner, AddrList),
+    Txn2MinerAddr = miner_ct_utils:node2addr(Txn2Miner, AddrList),
+    Txn3MinerAddr = miner_ct_utils:node2addr(Txn3Miner, AddrList),
+    Txn4MinerAddr = miner_ct_utils:node2addr(Txn4Miner, AddrList),
 
-    %% each txn should have been found in the queue
-    %% the txns may be spread over all the CG members
-    %% and as such their queue pos may not have changed ????
-    ?assert(Txn2QueuePosB > 0 andalso Txn2QueueLenB > 0),
-    ?assert(Txn3QueuePosB > 0 andalso Txn3QueueLenB > 0),
-    ?assert(Txn4QueuePosB > 0 andalso Txn4QueueLenB > 0),
+    %% query txns keys via txn mgr api
+    ?assert(txn_mgr_query_txn(Txn1Key, CurHeight, Txn1SubmitHeight, Miner, Txn1MinerAddr)),
+    ?assert(txn_mgr_query_txn(Txn2Key, CurHeight, Txn2SubmitHeight, Miner, Txn2MinerAddr)),
+    ?assert(txn_mgr_query_txn(Txn3Key, CurHeight, Txn3SubmitHeight, Miner, Txn3MinerAddr)),
+    ?assert(txn_mgr_query_txn(Txn4Key, CurHeight, Txn4SubmitHeight, Miner, Txn4MinerAddr)),
+
+    %% TODO:
+    %% ideally now we would be able to find a CG member
+    %% which has at least 2 our of txns in its buffer
+    %% and we would force it to process one of those
+    %% in order to get the queue positions of a txn to change
+    %% but i havent been able to work out a clean way
+    %% to do that yet that takes into account the txns
+    %% *may* be accepted by differing CG members
+
+%%    %% force one txn to be processed and then get the queue pos of the remaining txns
+%%    [
+%%        ok =
+%%            ct_rpc:call(
+%%                Node,
+%%                meck,
+%%                unload,
+%%                [hbbft_utils],
+%%                300
+%%            )
+%%    ||
+%%        Node <- [_Txn1Miner]
+%%    ],
+
+    true = miner_ct_utils:wait_until(
+                                        fun()->
+                                            maps:size(get_cached_txns_with_exclusions(Miner, IgnoredTxns)) == 0
+                                        end, 60, 100),
+
     ok.
 
 txn_from_future_via_protocol_v2_test(Cfg) ->
@@ -779,11 +778,24 @@ nonce_updated_for_miner(Addr, ExpectedNonce, ConMiners)->
             [true] == lists:usort(HaveNoncesIncremented)
         end, 200, 1000).
 
-query_txn([], _Txn) ->
+sidecar_query_txn([], _Txn) ->
     {error, not_found};
-query_txn([Miner | RestMiners], Txn) ->
-    case ct_rpc:call(Miner, miner_hbbft_sidecar, handle_txn, [query_txn, Txn]) of
+sidecar_query_txn([Miner | RestMiners], Txn) ->
+    Res = ct_rpc:call(Miner, miner_hbbft_sidecar, handle_txn, [update, Txn]),
+    ct:pal("query_txn res: ~p", [Res]),
+    case Res of
         {{ok, QueuePos, QueueLen}, Height} ->
             {ok, {Miner, Txn, QueuePos, QueueLen, Height}};
-        _ -> query_txn(RestMiners, Txn)
+        _ -> sidecar_query_txn(RestMiners, Txn)
     end.
+
+txn_mgr_query_txn(TxnKey, CurHeight, TxnSubmitHeight, Miner, PeerAddr) ->
+    ct:pal("txn mgr query, key: ~p, curheight: ~p, submitheight: ~p, miner: ~p, peeraddr: ~p",
+        [TxnKey, CurHeight, TxnSubmitHeight, Miner, PeerAddr]),
+    {ok, pending, TxnMgrData} = ct_rpc:call(Miner, blockchain_txn_mgr, txn_status, [TxnKey]),
+    ct:pal("TxnMgrData: ~p", [TxnMgrData]),
+    #{  key := TxnKey,
+        height := CurHeight,
+        recv_block_height := TxnSubmitHeight,
+        acceptors := Acceptors1 } = TxnMgrData,
+    ok == ?assert(lists:keymember(PeerAddr, 1, Acceptors1)).
