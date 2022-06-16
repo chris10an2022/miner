@@ -60,7 +60,7 @@ init_per_testcase(_TestCase, Config0) ->
     BlockTime =
         case _TestCase of
             txn_dependent_test -> 5000;
-%%            txn_queue_test -> 5000;
+%%            txn_queue_test -> 2000;
             _ -> ?config(block_time, Config)
         end,
 
@@ -363,13 +363,13 @@ txn_dependent_test(Config) ->
 
 
 txn_queue_test(Config) ->
-    %%
-    %% ------ WIP ----------
-    %%
     %% send a bunch of txns via the grpc submit API
-    %% meck out the queue on hbbft so that the txns dont get pushed to the CG
-    %% confirm the txns are in the sidecar buffer
-    %% and that the query API returns data on their queue position
+    %% wait for them to appear in the sidecar buffer
+    %% validate each txns position in the buffer
+    %% then force one txn to be dequeued from the buffer
+    %% and revalidate the queue positions of the remaining
+    %% txns
+
     Miners = ?config(miners, Config),
     NonConMiners = ?config(non_consensus_miners, Config),
     Miner = hd(NonConMiners),
@@ -392,7 +392,6 @@ txn_queue_test(Config) ->
     PayeeAddr = miner_ct_utils:node2addr(Payee, AddrList),
     {ok, _Pubkey, SigFun, _ECDHFun} = ct_rpc:call(Miner, blockchain_swarm, keys, []),
     IgnoredTxns = [blockchain_txn_poc_request_v1],
-    StartNonce = miner_ct_utils:get_nonce(Miner, Addr),
 
     %% meck out the sidecar random_n function
     %% make it return an empty list
@@ -415,9 +414,18 @@ txn_queue_test(Config) ->
 
     %% meck out the signatory_rand_members function
     %% force it to always return a deterministic list of acceptors
-    %% which will be a single consensus member
+    %% which in this case will be a single consensus member
+    %% this will result in the txn mgr pushing its cached txns
+    %% to this single CG member
+    %% and thus we can ensure we only need to check the sidecar
+    %% buffer on a single and known CG member
+
+    %% also meck out is_valid for payment txns
+    %% this test is not concerned with validity issues
     meck:new(blockchain_txn_mgr, [passthrough]),
+    meck:new(blockchain_txn_payment_v1, [passthrough]),
     [
+        begin
             ok =
             ct_rpc:call(
                 Node,
@@ -425,11 +433,27 @@ txn_queue_test(Config) ->
                 expect,
                 [blockchain_txn_mgr, signatory_rand_members, fun(_, _, _, _, _) -> {ok, [ConMiner1Addr]} end],
                 3000
+            ),
+            ok =
+            ct_rpc:call(
+                Node,
+                meck,
+                expect,
+                [blockchain_txn_payment_v1, is_valid, fun(_, _) -> ok end],
+                3000
             )
+        end
     ||
         Node <- Miners
     ],
+
+    %% get the start height, after all prep
+    {ok, Height} = ct_rpc:call(Miner, blockchain, height, [Chain]),
+
     %% prep the txns, 1 - 4
+    ok = miner_ct_utils:wait_for_gte(height_exactly, Miners, Height + 2),
+    StartNonce = miner_ct_utils:get_nonce(Miner, Addr),
+    ct:pal("start nonce: ~p", [StartNonce]),
     Txn1 = ct_rpc:call(Miner, blockchain_txn_payment_v1, new, [PayerAddr, PayeeAddr, 1000, StartNonce+1]),
     SignedTxn1 = ct_rpc:call(Miner, blockchain_txn_payment_v1, sign, [Txn1, SigFun]),
     Txn2 = ct_rpc:call(Miner, blockchain_txn_payment_v1, new, [PayerAddr, PayeeAddr, 1000, StartNonce+2]),
@@ -439,27 +463,54 @@ txn_queue_test(Config) ->
     Txn4 = ct_rpc:call(Miner, blockchain_txn_payment_v1, new, [PayerAddr, PayeeAddr, 1000, StartNonce+4]),
     SignedTxn4 = ct_rpc:call(Miner, blockchain_txn_payment_v1, sign, [Txn4, SigFun]),
 
-    %% get the start height
-    {ok, Height} = ct_rpc:call(Miner, blockchain, height, [Chain]),
 
-    %% submit the txns via the grpc endpoint
-    ok = miner_ct_utils:wait_for_gte(height_exactly, Miners, Height + 1),
+    %% submit the txns via the txn mgr api
+    %% same API as used by the grpc txn submit
+    %% submit each txn at 1 block intervals
+    %% helps to ensure they get submitted in order to sidecar
+    ok = miner_ct_utils:wait_for_gte(height_exactly, Miners, Height + 3),
     {ok, Txn1Key, Txn1SubmitHeight} = ct_rpc:call(Miner, blockchain_txn_mgr, grpc_submit, [SignedTxn1]),
+    ok = miner_ct_utils:wait_for_gte(height_exactly, Miners, Height + 4),
     {ok, Txn2Key, Txn2SubmitHeight} = ct_rpc:call(Miner, blockchain_txn_mgr, grpc_submit, [SignedTxn2]),
+    ok = miner_ct_utils:wait_for_gte(height_exactly, Miners, Height + 5),
     {ok, Txn3Key, Txn3SubmitHeight} = ct_rpc:call(Miner, blockchain_txn_mgr, grpc_submit, [SignedTxn3]),
+    ok = miner_ct_utils:wait_for_gte(height_exactly, Miners, Height + 6),
     {ok, Txn4Key, Txn4SubmitHeight} = ct_rpc:call(Miner, blockchain_txn_mgr, grpc_submit, [SignedTxn4]),
-
-    %% Wait a few blocks
     ok = miner_ct_utils:wait_for_gte(height_exactly, Miners, Height + 7),
 
-    %% confirm all txns are still be in txn mgr cache
+    %% we dont want the txns being submitted multiple times to the same CG member
+    %% so force no new members to be returned as available dialers
+    ok = miner_ct_utils:wait_for_gte(height_exactly, Miners, Height + 8),
+    [
+            ok =
+            ct_rpc:call(
+                Node,
+                meck,
+                expect,
+                [blockchain_txn_mgr, signatory_rand_members, fun(_, _, _, _, _) -> {ok, []} end],
+                3000
+            )
+    ||
+        Node <- Miners
+    ],
+
+    %% confirm all txns are in txn mgr cache
     true = miner_ct_utils:wait_until(
         fun()->
             maps:size(get_cached_txns_with_exclusions(Miner, IgnoredTxns)) == 4
         end, 60, 500),
 
-    %% query txns keys via txn mgr api
-    %% query the same txn mgr the txns were submitted too
+    %% query the cg member's sidecar and confirm buffer queue data
+    ok = miner_ct_utils:wait_for_gte(height_exactly, Miners, Height + 9),
+    {{ok, 1, 4}, _}  = ct_rpc:call(ConMiner1, miner_hbbft_sidecar, handle_txn, [update, SignedTxn1]),
+    {{ok, 2, 4}, _}  = ct_rpc:call(ConMiner1, miner_hbbft_sidecar, handle_txn, [update, SignedTxn2]),
+    {{ok, 3, 4}, _}  = ct_rpc:call(ConMiner1, miner_hbbft_sidecar, handle_txn, [update, SignedTxn3]),
+    {{ok, 4, 4}, _}  = ct_rpc:call(ConMiner1, miner_hbbft_sidecar, handle_txn, [update, SignedTxn4]),
+
+    %% query the txn mgr txn status API
+    %% this should give us back the same data as the above
+    %% sidecar query
+    ok = miner_ct_utils:wait_for_gte(height_exactly, Miners, Height + 12),
     {ok, Txn1Key, Txn1SubmitHeight, [{ConMiner1Addr, _, 1, 4}]} =
         txn_mgr_query_txn(Txn1Key, Miner),
     {ok, Txn2Key, Txn2SubmitHeight, [{ConMiner1Addr, _, 2, 4}]} =
@@ -469,7 +520,11 @@ txn_queue_test(Config) ->
     {ok, Txn4Key, Txn4SubmitHeight, [{ConMiner1Addr, _, 4, 4}]} =
         txn_mgr_query_txn(Txn4Key, Miner),
 
-    %% force one txn to be processed and then get the queue pos of the remaining txns
+    %% force one txn in the sidecar buffer to be processed
+    %% and then get the queue pos of the remaining txns
+    %% force the random_n function to return txn1
+    %% when this is processed txns 2 - 4 will all then
+    %% move up the buffer
     [
         ok =
             ct_rpc:call(
@@ -480,21 +535,42 @@ txn_queue_test(Config) ->
                 300
             )
     ||
-        Node <- [ConMiner1]
+        Node <- ConMiners
+    ],
+    %% wait for a block to allow txn1 to be dequeued
+    %% and then force random_n to return an empty list again
+    ok = miner_ct_utils:wait_for_gte(height_exactly, Miners, Height + 13),
+    [
+        ok =
+            ct_rpc:call(
+                Node,
+                meck,
+                expect,
+                [hbbft_utils, random_n, fun(_, _) -> [] end],
+                300
+            )
+    ||
+        Node <- ConMiners
     ],
 
-    ok = miner_ct_utils:wait_for_gte(height_exactly, Miners, Height + 12),
+    %% await at least 5 blocks
+    %% this gives time for the txn's updated queue data
+    %% to be propogated back to txn mgr cache
+    ok = miner_ct_utils:wait_for_gte(height_exactly, Miners, Height + 19),
 
-    %% requery the txn list via txn mgr
-    %% one txn should have been mined
-    %% and thus the remaining 3's queue position will bump
-    %% and the queue len with reduce by 1
+    %% requery the cg member's sidecar and confirm new buffer queue data
+    {{ok, 1, 3}, _}  = ct_rpc:call(ConMiner1, miner_hbbft_sidecar, handle_txn, [update, SignedTxn2]),
+    {{ok, 2, 3}, _}  = ct_rpc:call(ConMiner1, miner_hbbft_sidecar, handle_txn, [update, SignedTxn3]),
+    {{ok, 3, 3}, _}  = ct_rpc:call(ConMiner1, miner_hbbft_sidecar, handle_txn, [update, SignedTxn4]),
+    {{error, not_found}, _IgnoreHeight}  = ct_rpc:call(ConMiner1, miner_hbbft_sidecar, handle_txn, [update, SignedTxn1]),
+
+    %% requery the txn list via txn mgr api
     {ok, Txn2Key, Txn2SubmitHeight, [{ConMiner1Addr, _, 1, 3}]} =
-        txn_mgr_query_txn(Txn1Key, Miner),
-    {ok, Txn3Key, Txn2SubmitHeight, [{ConMiner1Addr, _, 2, 3}]} =
-        txn_mgr_query_txn(Txn1Key, Miner),
-   {ok, Txn4Key, Txn2SubmitHeight, [{ConMiner1Addr, _, 3, 3}]} =
-        txn_mgr_query_txn(Txn1Key, Miner),
+        txn_mgr_query_txn(Txn2Key, Miner),
+    {ok, Txn3Key, Txn3SubmitHeight, [{ConMiner1Addr, _, 2, 3}]} =
+        txn_mgr_query_txn(Txn3Key, Miner),
+   {ok, Txn4Key, Txn4SubmitHeight, [{ConMiner1Addr, _, 3, 3}]} =
+        txn_mgr_query_txn(Txn4Key, Miner),
 
     %% confirm txn mgr only contains 3 txns in its cache
     true = miner_ct_utils:wait_until(
@@ -780,17 +856,6 @@ nonce_updated_for_miner(Addr, ExpectedNonce, ConMiners)->
                           end, ConMiners),
             [true] == lists:usort(HaveNoncesIncremented)
         end, 200, 1000).
-
-sidecar_query_txn([], _Txn) ->
-    {error, not_found};
-sidecar_query_txn([Miner | RestMiners], Txn) ->
-    Res = ct_rpc:call(Miner, miner_hbbft_sidecar, handle_txn, [update, Txn]),
-    ct:pal("query_txn res: ~p", [Res]),
-    case Res of
-        {{ok, QueuePos, QueueLen}, Height} ->
-            {ok, {Miner, Txn, QueuePos, QueueLen, Height}};
-        _ -> sidecar_query_txn(RestMiners, Txn)
-    end.
 
 txn_mgr_query_txn(TxnKey, Miner) ->
     ct:pal("txn mgr query, key: ~p, miner: ~p",
