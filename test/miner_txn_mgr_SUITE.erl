@@ -7,6 +7,7 @@
 
 -include_lib("blockchain/include/blockchain_vars.hrl").
 -include_lib("blockchain/include/blockchain.hrl").
+-include_lib("helium_proto/include/blockchain_txn_handler_pb.hrl").
 
 -include("miner_ct_macros.hrl").
 
@@ -807,7 +808,7 @@ txn_submit(Node, Txn) ->
     SubmissionRef.
 
 fetch_deferred_rejections(Node, TxnHash) ->
-    IsMatch = fun({_, _, T, _, _}) -> TxnHash =:= blockchain_txn:hash(T) end,
+    IsMatch = fun({_, _, _, T, _}) -> TxnHash =:= blockchain_txn:hash(T) end,
     Deferred = ct_rpc:call(Node, blockchain_txn_mgr, get_rejections_deferred, []),
     [T || T <- Deferred, IsMatch(T)].
 
