@@ -132,6 +132,7 @@ handle_call({set_group, Group}, _From, #state{group = OldGroup} = State) ->
                                                   [blockchain_txn_handler, ?TX_PROTOCOL_V1, self(),
                                                    fun(_, T) -> ?MODULE:submit(T) end]});
         {P, undefined} when is_pid(P) ->
+            libp2p_swarm:remove_stream_handler(blockchain_swarm:tid(), ?TX_PROTOCOL_V3),
             libp2p_swarm:remove_stream_handler(blockchain_swarm:tid(), ?TX_PROTOCOL_V2),
             libp2p_swarm:remove_stream_handler(blockchain_swarm:tid(), ?TX_PROTOCOL_V1)
     end,
