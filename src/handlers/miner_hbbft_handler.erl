@@ -246,7 +246,7 @@ handle_command({txn, Txn}, State=#state{hbbft=HBBFT}) ->
                     {reply, {ok, Position, Length}, fixup_msgs(Msgs), State#state{hbbft=NewHBBFT}}
             end
     end;
-handle_command({query_txn, Txn}, State = #state{hbbft = HBBFT}) ->
+handle_command({query_txn, Txn}, _State = #state{hbbft = HBBFT}) ->
     Buf = hbbft:buf(HBBFT),
     SerTxn = blockchain_txn:serialize(Txn),
     case current_buffer_position(Buf, SerTxn) of
