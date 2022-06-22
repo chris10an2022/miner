@@ -87,10 +87,8 @@ prefilter_round(Buf, Txns) ->
     gen_server:call(?SERVER, {prefilter_round, Buf, Txns}, infinity).
 
 handle_txn(submit = RequestType, Txn) ->
-    lager:debug("handling txn with request type ~p", [RequestType]),
     gen_server:call(?SERVER, {submit, Txn}, infinity);
 handle_txn(update = RequestType, Txn) ->
-    lager:debug("handling txn with request type ~p", [RequestType]),
     gen_server:call(?SERVER, {query_txn, Txn}, infinity).
 
 %%%===================================================================
