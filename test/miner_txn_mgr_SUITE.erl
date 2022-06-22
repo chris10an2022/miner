@@ -67,6 +67,8 @@ init_per_testcase(_TestCase, Config0) ->
     BlockTime =
         case _TestCase of
             txn_dependent_test -> 5000;
+            txn_queue_protocol_v2_test -> 5000;
+            txn_queue_protocol_v1_test -> 5000;
             _ -> ?config(block_time, Config)
         end,
 
@@ -766,7 +768,7 @@ txn_queue_common_test(Config) ->
         end, 60, 500),
 
     %% query the cg member's sidecar and confirm buffer queue data
-    ok = miner_ct_utils:wait_for_gte(height_exactly, Miners, Height + 9),
+    ok = miner_ct_utils:wait_for_gte(height_exactly, Miners, Height + 10),
     {{ok, 1, 4}, _}  = ct_rpc:call(ConMiner1, miner_hbbft_sidecar, handle_txn, [update, SignedTxn1]),
     {{ok, 2, 4}, _}  = ct_rpc:call(ConMiner1, miner_hbbft_sidecar, handle_txn, [update, SignedTxn2]),
     {{ok, 3, 4}, _}  = ct_rpc:call(ConMiner1, miner_hbbft_sidecar, handle_txn, [update, SignedTxn3]),
@@ -788,7 +790,7 @@ txn_queue_common_test(Config) ->
             txn4_submit_height => Txn4SubmitHeight,
             con_miner_1 => ConMiner1,
             miner => Miner,
-            last_height =>  Height + 9
+            last_height =>  Height + 10
         }} | Config].
 
 txn_from_future_via_protocol_v3_test(Cfg) ->

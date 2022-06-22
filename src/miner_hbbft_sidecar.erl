@@ -126,11 +126,11 @@ handle_call({set_group, Group}, _From, #state{group = OldGroup} = State) ->
             ok = libp2p_swarm:add_stream_handler(blockchain_swarm:tid(), ?TX_PROTOCOL_V2,
                                                  {libp2p_framed_stream, server,
                                                   [blockchain_txn_handler, ?TX_PROTOCOL_V2, self(),
-                                                   fun(_, T) -> ?MODULE:submit(T) end]}),
+                                                   fun(submit, T) -> ?MODULE:submit(T); (_, T) -> {error, req_not_supported} end]}),
             ok = libp2p_swarm:add_stream_handler(blockchain_swarm:tid(), ?TX_PROTOCOL_V1,
                                                  {libp2p_framed_stream, server,
                                                   [blockchain_txn_handler, ?TX_PROTOCOL_V1, self(),
-                                                   fun(_, T) -> ?MODULE:submit(T) end]});
+                                                   fun(submit, T) -> ?MODULE:submit(T); (_, T) -> {error, req_not_supported} end]});
         {P, undefined} when is_pid(P) ->
             libp2p_swarm:remove_stream_handler(blockchain_swarm:tid(), ?TX_PROTOCOL_V3),
             libp2p_swarm:remove_stream_handler(blockchain_swarm:tid(), ?TX_PROTOCOL_V2),
@@ -282,7 +282,7 @@ handle_info({Ref, {Res, Height}}, #state{validations = Validations, chain = Chai
                         lager:warning("validation timed out for ~s", [blockchain_txn:print(Txn)]),
                         gen_server:reply(From, {Error, Height}),
                         ok;
-                    {error, Error} ->
+                    {error, _Reason} = Error ->
                         write_txn("failed", Height, Txn),
                         ok = update_validation_metric(?INVALID_TXNS, Type),
                         lager:warning("is_valid failed for ~s, error: ~p", [blockchain_txn:print(Txn), Error]),

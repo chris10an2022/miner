@@ -215,8 +215,7 @@ handle_command({txn, Txn}, State=#state{hbbft=HBBFT}) ->
     Buf = hbbft:buf(HBBFT),
     case lists:member(blockchain_txn:serialize(Txn), Buf) of
         true ->
-            %% TODO return the existent position in Buf
-            {reply, ok, ignore};
+            {reply, already_queued, ignore};
         false ->
             %% sort non poc transactions first
             Comparator = case blockchain_txn:type(Txn) of
